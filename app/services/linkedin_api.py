@@ -1,4 +1,103 @@
-﻿# app/services/linkedin_api.py
+﻿# Create an article share (OG link)
+def post_article_share(access_token: str, author_urn: str, url: str, text: str = "") -> tuple:
+    payload = {
+        "author": author_urn,
+        "lifecycleState": "PUBLISHED",
+        "specificContent": {
+            "com.linkedin.ugc.ShareContent": {
+                "shareCommentary": {"text": text},
+                "shareMediaCategory": "ARTICLE",
+                "media": [{"status": "READY", "originalUrl": url}]
+            }
+        },
+        "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"},
+    }
+    with httpx.Client(timeout=60) as c:
+        r = c.post(
+            UGC_URL,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "X-Restli-Protocol-Version": "2.0.0",
+            },
+            json=payload,
+        )
+        return r.status_code in (201, 202), r
+
+# Register image upload
+def register_image_upload(access_token: str, author_urn: str) -> dict:
+    register_url = "https://api.linkedin.com/v2/assets?action=registerUpload"
+    payload = {
+        "registerUploadRequest": {
+            "owner": author_urn,
+            "recipes": ["urn:li:digitalmediaRecipe:feedshare-image"],
+            "serviceRelationships": [{
+                "relationshipType": "OWNER",
+                "identifier": "urn:li:userGeneratedContent"
+            }]
+        }
+    }
+    with httpx.Client(timeout=60) as c:
+        r = c.post(
+            register_url,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+        r.raise_for_status()
+        return r.json()
+
+# Upload image asset
+def upload_image_asset(upload_url: str, image_bytes: bytes) -> bool:
+    headers = {"Content-Type": "application/octet-stream"}
+    with httpx.Client(timeout=60) as c:
+        r = c.put(upload_url, headers=headers, content=image_bytes)
+        return r.status_code in (201, 202)
+
+# Create image share post
+def post_image_share(access_token: str, author_urn: str, asset_urn: str, text: str = "") -> tuple:
+    payload = {
+        "author": author_urn,
+        "lifecycleState": "PUBLISHED",
+        "specificContent": {
+            "com.linkedin.ugc.ShareContent": {
+                "shareCommentary": {"text": text},
+                "shareMediaCategory": "IMAGE",
+                "media": [{"status": "READY", "media": asset_urn}]
+            }
+        },
+        "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"},
+    }
+    with httpx.Client(timeout=60) as c:
+        r = c.post(
+            UGC_URL,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "X-Restli-Protocol-Version": "2.0.0",
+            },
+            json=payload,
+        )
+        return r.status_code in (201, 202), r
+# Exchange refresh_token for new access token
+def exchange_refresh_for_token(refresh_token: str) -> dict:
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": settings.linkedin_client_id,
+        "client_secret": settings.linkedin_client_secret,
+    }
+    with httpx.Client(timeout=httpx.Timeout(30, connect=5)) as c:
+        r = c.post(
+            TOKEN_URL,
+            data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        r.raise_for_status()
+        return r.json()
+# app/services/linkedin_api.py
 import httpx
 import time
 from typing import Tuple, Dict, Any
@@ -113,11 +212,21 @@ def post_text(access_token: str, author_urn: str, text: str) -> Tuple[bool, str]
             print("[post_text] status:", r.status_code, flush=True)
             print("[post_text] request json:", payload, flush=True)
             print("[post_text] response text:", r.text, flush=True)
-            # Return request id for traceability
             log_request_id(r)
-            return r.status_code in (201, 202), r if r.status_code in (201, 202) else r
+            if r.status_code in (201, 202):
+                return True, r
+            # Bubble up error details for 4xx/5xx
+            error_info = {
+                "status": r.status_code,
+                "body": r.text
+            }
+            try:
+                err_json = r.json()
+                error_info["serviceErrorCode"] = err_json.get("serviceErrorCode")
+                error_info["message"] = err_json.get("message")
+            except Exception:
+                pass
+            return False, error_info
     except Exception as e:
         print("[post_text] error:", e, flush=True)
-        return False, str(e)
-    except Exception as e:
-        return False, f"exception: {e}"
+        return False, {"exception": str(e)}

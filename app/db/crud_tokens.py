@@ -1,4 +1,26 @@
-﻿from datetime import datetime, timezone, timedelta
+﻿# Helper: returns True if token is missing or expires within skew_seconds (default 5 min)
+def is_token_expiring(tok, skew_seconds=300):
+    from datetime import datetime, timezone, timedelta
+    if not tok or not getattr(tok, "expires_at", None):
+        return True
+    now = datetime.now(timezone.utc)
+    return tok.expires_at <= now + timedelta(seconds=skew_seconds)
+# Update only access_token and expires_at for latest token
+def update_access_token_only(db: Session, user_id: int, access_token: str, expires_in: int) -> Optional[models.LinkedInToken]:
+    tok = (
+        db.query(models.LinkedInToken)
+        .filter(models.LinkedInToken.user_id == user_id)
+        .order_by(models.LinkedInToken.id.desc())
+        .first()
+    )
+    if not tok:
+        return None
+    tok.access_token_encrypted = token_crypto.encrypt_token(access_token)
+    tok.expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+    db.commit()
+    db.refresh(tok)
+    return tok
+from datetime import datetime, timezone, timedelta
 from sqlalchemy.orm import Session
 from typing import Optional
 from app.db import models; from app.db import token_crypto

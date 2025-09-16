@@ -1,8 +1,42 @@
-﻿# POST /auth/linkedin/refresh { user_id }
+﻿# GET /auth/linkedin/me?user_id=…
+@router.get("/me")
+def linkedin_me(user_id: int, db: Session = Depends(get_db)):
+    from app.db.models import User
+    refreshed = False
+    user = db.query(User).filter(User.id == user_id).first()
+    tok = crud_tokens.get_latest_token(db, user_id=user_id)
+    member_id = user.member_id if user else None
+    expires_at = getattr(tok, "expires_at", None)
+    has_refresh_token = bool(getattr(tok, "refresh_token_encrypted", None))
+    # If token is expiring and refresh token exists, try to refresh
+    if tok and crud_tokens.is_token_expiring(tok) and has_refresh_token:
+        refresh_token = crud_tokens.get_latest_refresh_token(db, user_id)
+        if refresh_token:
+            from app.db.token_crypto import decrypt_token as decrypt_refresh
+            try:
+                plain_refresh = decrypt_refresh(refresh_token)
+                resp = linkedin_api.exchange_refresh_for_token(plain_refresh)
+                access_token_new = resp.get("access_token")
+                expires_in_new = resp.get("expires_in", 3600)
+                if access_token_new:
+                    crud_tokens.update_access_token_only(db, user_id, access_token_new, expires_in_new)
+                    tok = crud_tokens.get_latest_token(db, user_id=user_id)
+                    expires_at = getattr(tok, "expires_at", None)
+                    refreshed = True
+            except Exception:
+                refreshed = False
+    return {
+        "member_id": member_id,
+        "token_expires_at": expires_at.isoformat() if expires_at else None,
+        "has_refresh_token": has_refresh_token,
+        "refreshed": refreshed
+    }
+# POST /auth/linkedin/refresh { user_id }
 from pydantic import BaseModel
 
 class RefreshIn(BaseModel):
     user_id: int
+
 
 router = APIRouter(prefix="/auth/linkedin", tags=["linkedin-auth"])
 
@@ -84,19 +118,23 @@ def callback(
     access_token = token_resp.get("access_token")
     expires_in = token_resp.get("expires_in", 3600)
     id_token = token_resp.get("id_token")  # present because we requested 'openid'
+    refresh_token = token_resp.get("refresh_token")
 
     if not access_token:
         # Never leak secrets in error details
         return error_response(400, "Token exchange failed", {k: v for k, v in token_resp.items() if k != "client_secret"})
 
-    # Create local user + store encrypted access token
+    # Create local user + store encrypted access token and refresh token
     user = crud_tokens.upsert_user(db, email=None)
-    crud_tokens.save_linkedin_token(db, user.id, access_token, expires_in)
+    crud_tokens.save_linkedin_token(db, user.id, access_token, expires_in, refresh_token)
 
     # If using OpenID, pull the member id from the id_token's 'sub'
     member_id = linkedin_api.extract_sub_from_id_token(id_token) if id_token else None
     if member_id:
         print("LinkedIn member_id (sub):", member_id, flush=True)
+        # Store member_id in User
+        user.member_id = member_id
+        db.commit()
 
     return {
         "status": "ok",
