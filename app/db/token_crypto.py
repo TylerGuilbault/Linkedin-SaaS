@@ -10,4 +10,10 @@ def encrypt_token(plain: str) -> str:
     return _fernet().encrypt(plain.encode()).decode()
 
 def decrypt_token(cipher: str) -> str:
-    return _fernet().decrypt(cipher.encode()).decode()
+    from cryptography.fernet import InvalidToken
+    try:
+        return _fernet().decrypt(cipher.encode()).decode()
+    except (TypeError, InvalidToken) as e:
+        # Log and propagate for caller to handle (return 400)
+        print(f"[token_crypto] Decrypt error: {e}", flush=True)
+        raise

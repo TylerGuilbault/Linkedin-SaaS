@@ -35,5 +35,6 @@ class LinkedInToken(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     access_token_encrypted = Column(Text, nullable=False)
+    refresh_token_encrypted = Column(Text, nullable=True)  # encrypted refresh token
     expires_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

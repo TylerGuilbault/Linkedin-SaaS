@@ -1,4 +1,40 @@
-﻿# app/routers/auth_linkedin.py
+﻿# POST /auth/linkedin/refresh { user_id }
+from pydantic import BaseModel
+
+class RefreshIn(BaseModel):
+    user_id: int
+
+router = APIRouter(prefix="/auth/linkedin", tags=["linkedin-auth"])
+
+@router.post("/refresh")
+def refresh_linkedin_token(body: RefreshIn, db: Session = Depends(get_db)):
+    refresh_token = crud_tokens.get_latest_refresh_token(db, user_id=body.user_id)
+    if not refresh_token:
+        return error_response(400, "No refresh_token found for this user_id.")
+    try:
+        token_resp = linkedin_api.exchange_refresh_for_token(refresh_token)
+    except Exception as e:
+        return error_response(400, f"LinkedIn refresh failed: {e}")
+    access_token = token_resp.get("access_token")
+    expires_in = token_resp.get("expires_in", 3600)
+    new_refresh_token = token_resp.get("refresh_token", refresh_token)
+    if not access_token:
+        return error_response(400, "No access_token in LinkedIn response.", token_resp)
+    crud_tokens.save_linkedin_token(db, body.user_id, access_token, expires_in, new_refresh_token)
+    return {"status": "ok", "access_token": "updated", "expires_in": expires_in}
+# Centralized error response helper
+def error_response(status_code: int, message: str, details: dict = None):
+    # Never include secrets or sensitive config in error details
+    safe_details = {k: v for k, v in (details or {}).items() if k != "client_secret"}
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status": "error",
+            "message": message,
+            "details": safe_details,
+        },
+    )
+# app/routers/auth_linkedin.py
 import secrets
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
@@ -35,19 +71,13 @@ def callback(
     if error:
         if state in STATE_STORE:
             STATE_STORE.discard(state)
-        return JSONResponse(
-            status_code=400,
-            content={"status": "error", "error": error, "error_description": error_description},
-        )
+        return error_response(400, error, {"error_description": error_description})
 
     if not code or not state:
-        return JSONResponse(
-            status_code=400,
-            content={"status": "error", "message": "Missing ?code or ?state in callback"},
-        )
+        return error_response(400, "Missing ?code or ?state in callback")
 
     if state not in STATE_STORE:
-        raise HTTPException(400, "Invalid state")
+        return error_response(400, "Invalid state")
     STATE_STORE.discard(state)
 
     token_resp = linkedin_api.exchange_code_for_token(code)
@@ -56,7 +86,8 @@ def callback(
     id_token = token_resp.get("id_token")  # present because we requested 'openid'
 
     if not access_token:
-        raise HTTPException(400, f"Token exchange failed: {token_resp}")
+        # Never leak secrets in error details
+        return error_response(400, "Token exchange failed", {k: v for k, v in token_resp.items() if k != "client_secret"})
 
     # Create local user + store encrypted access token
     user = crud_tokens.upsert_user(db, email=None)
