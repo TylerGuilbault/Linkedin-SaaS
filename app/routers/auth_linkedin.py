@@ -170,7 +170,8 @@ def whoami(user_id: int = Query(...), db: Session = Depends(get_db)):
     if not tok:
         return {"status": "no_token"}
 
-    access_token = _dec(tok.access_token_encrypted)
+    from app.db import token_crypto
+    access_token = token_crypto.decrypt_token(tok.access_token_encrypted)
     token_sub = userinfo_sub(access_token) or None
 
     user = db.query(User).filter(User.id == user_id).first()
@@ -226,6 +227,24 @@ def set_person_id(user_id: int, person_id: str, db: Session = Depends(get_db)):
     return {"status": "ok", "person_id": person_id}
 
 
+@router.post("/set_member_id")
+def set_member_id(user_id: int, member_id: str, db: Session = Depends(get_db)):
+    """Admin helper: persist an OpenID member_id (the id_token 'sub') for a user.
+    Use this to manually set the member_id that will be used as urn:li:member:{member_id}.
+    """
+    if not member_id or not isinstance(member_id, str):
+        raise HTTPException(400, "member_id must be a non-empty string")
+    # basic validation: disallow spaces and control chars
+    if any(c.isspace() for c in member_id):
+        raise HTTPException(400, "member_id must not contain whitespace")
+    try:
+        from app.db import crud_tokens as ct
+        ct.set_user_member_id(db, user_id, member_id)
+    except Exception as e:
+        raise HTTPException(500, f"Failed to persist member id: {e}")
+    return {"status": "ok", "member_id": member_id}
+
+
 @router.get("/me_raw")
 def me_raw(user_id: int, db: Session = Depends(get_db)):
     """Dev helper: return the raw /v2/me response (status, headers, text, json) using the stored token."""
@@ -235,3 +254,33 @@ def me_raw(user_id: int, db: Session = Depends(get_db)):
     access = _dec(tok.access_token_encrypted)
     out = linkedin_api.get_me_raw(access)
     return {"status": "ok", "me_raw": out}
+
+
+@router.post("/refresh")
+def refresh(body: dict, db: Session = Depends(get_db)):
+    """Use stored refresh token to obtain a new access token and persist it.
+    Expects JSON: {"user_id": <int>}.
+    """
+    user_id = body.get("user_id") if isinstance(body, dict) else None
+    if not user_id:
+        raise HTTPException(400, "Missing user_id in request body")
+
+    # Get the refresh token plaintext from crud helper (it returns the decrypted token or None)
+    plain_refresh = crud_tokens.get_latest_refresh_token(db, user_id)
+    if not plain_refresh:
+        raise HTTPException(400, "No refresh token available for this user")
+
+    try:
+        resp = linkedin_api.exchange_refresh_for_token(plain_refresh)
+    except Exception as e:
+        raise HTTPException(401, f"LinkedIn refresh failed: {e}")
+
+    new_at = resp.get("access_token")
+    new_exp = resp.get("expires_in", 3600)
+    if not new_at:
+        raise HTTPException(400, f"No access_token in refresh response: {resp}")
+
+    # Persist new access token on the latest token row
+    crud_tokens.update_access_token_only(db, user_id, new_at, new_exp)
+
+    return {"status": "ok", "access_token": "updated", "expires_in": new_exp}

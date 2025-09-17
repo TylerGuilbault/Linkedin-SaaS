@@ -4,6 +4,10 @@ import time
 from typing import Tuple, Dict, Any
 from urllib.parse import urlencode, quote
 from app.config import settings
+import os
+
+# Verbose logging flag (dev only)
+VERBOSE_LINKEDIN_LOG = os.getenv("LINKEDIN_VERBOSE_LOGGING", "false").lower() in ("1", "true", "yes")
 
 AUTH_URL  = "https://www.linkedin.com/oauth/v2/authorization"
 TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
@@ -326,10 +330,48 @@ def post_text(access_token: str, author_urn: str, text: str) -> Tuple[bool, Any]
                 },
                 json=payload,
             )
+            # Basic logs (kept)
             print("[post_text] status:", r.status_code, flush=True)
             print("[post_text] request json:", payload, flush=True)
             print("[post_text] response text:", r.text, flush=True)
             log_request_id(r)
+
+            # Verbose: print request headers, response headers when enabled
+            if VERBOSE_LINKEDIN_LOG:
+                try:
+                    verbose_out = {
+                        "request_headers": {
+                            "Authorization": f"Bearer {access_token}",
+                            "Content-Type": "application/json",
+                            "X-Restli-Protocol-Version": "2.0.0",
+                        },
+                        "request_json": payload,
+                        "response_status": r.status_code,
+                        "response_headers": dict(r.headers),
+                        "response_text": r.text,
+                    }
+                    try:
+                        with open('/tmp/linkedin_verbose.log', 'a') as f:
+                            f.write("--- POST_TEXT VERBOSE ---\n")
+                            f.write(str(verbose_out) + "\n")
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            # Additionally, when verbose enabled, print request headers/body and response headers to stdout
+            if VERBOSE_LINKEDIN_LOG:
+                try:
+                    req = getattr(r, 'request', None)
+                    if req is not None:
+                        try:
+                            req_body = req.content.decode('utf-8') if isinstance(req.content, (bytes, bytearray)) else str(req.content)
+                        except Exception:
+                            req_body = str(req.content)
+                        print('[post_text][VERBOSE] Outgoing request headers:', dict(req.headers), flush=True)
+                        print('[post_text][VERBOSE] Outgoing request body:', req_body, flush=True)
+                    print('[post_text][VERBOSE] Response headers:', dict(r.headers), flush=True)
+                except Exception as e:
+                    print('[post_text][VERBOSE] error printing verbose info:', e, flush=True)
             if r.status_code in (201, 202):
                 return True, r
             # Bubble up error details for 4xx/5xx
