@@ -1,6 +1,0 @@
-HTTP/1.1 307 Temporary Redirect
-date: Wed, 17 Sep 2025 17:28:32 GMT
-server: uvicorn
-content-length: 0
-location: https://www.linkedin.com/oauth/v2/authorization?response_type=code&client_id=86j1qkk8iaowxv&redirect_uri=https://ideal-space-happiness-974xg6wj6qxvh7wv7-8000.app.github.dev/auth/linkedin/callback&scope=openid%20profile%20w_member_social&state=10eQL7DN64-byXp6mklmAyNTAr3Kgtrc
-
