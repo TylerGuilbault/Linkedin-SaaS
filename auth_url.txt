@@ -1,0 +1,1 @@
+https://www.linkedin.com/oauth/v2/authorization?response_type=code&client_id=86j1qkk8iaowxv&redirect_uri=https://ideal-space-happiness-974xg6wj6qxvh7wv7-8000.app.github.dev/auth/linkedin/callback&scope=openid%20profile%20w_member_social&state=F1MapCDI4uIw9tQQU7GL1jQQfvcjLUQP

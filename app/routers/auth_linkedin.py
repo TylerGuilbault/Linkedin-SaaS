@@ -110,6 +110,59 @@ def callback(
         "member_id": member_id or None,
     }
 
+
+if settings.enable_dev_endpoints:
+    @router.get("/callback_no_state")
+    def callback_no_state(
+        code: Optional[str] = None,
+        db: Session = Depends(get_db),
+    ):
+        """Dev helper: Exchange a code for tokens without validating state. Disabled by default.
+        Returns the same JSON as the normal callback.
+        """
+        if not code:
+            return JSONResponse(status_code=400, content={"status": "error", "message": "Missing code"})
+
+        token_resp = linkedin_api.exchange_code_for_token(code)
+        access_token = token_resp.get("access_token")
+        expires_in = token_resp.get("expires_in", 3600)
+        id_token = token_resp.get("id_token")
+        refresh_token = token_resp.get("refresh_token")
+
+        if not access_token:
+            raise HTTPException(400, f"Token exchange failed: {token_resp}")
+
+        # Extract member_id from id_token.sub (OpenID Connect). Do NOT call /v2/me here.
+        member_id = linkedin_api.extract_sub_from_id_token(id_token) if id_token else ""
+
+        # If we have an OpenID sub (member_id), try to reuse an existing User with that member_id.
+        user = None
+        if member_id:
+            user = db.query(User).filter(User.member_id == member_id).first()
+
+        # If no matching user, create one
+        if not user:
+            user = crud_tokens.upsert_user(db, email=None)
+
+        # Save token for the resolved user
+        crud_tokens.save_linkedin_token(db, user.id, access_token, expires_in, refresh_token)
+
+        # Persist member_id on the user row if we have one and it's not set
+        if member_id:
+            try:
+                if not user.member_id:
+                    crud_tokens.set_user_member_id(db, user.id, member_id)
+            except Exception:
+                print("Failed to persist member_id on user", flush=True)
+
+        return {
+            "status": "ok",
+            "user_id": user.id,
+            "expires_in": expires_in,
+            "has_id_token": bool(id_token),
+            "member_id": member_id or None,
+        }
+
 # Debug helper to compare token owner and stored member_id
 @router.get("/debug/whoami")
 def whoami(user_id: int = Query(...), db: Session = Depends(get_db)):

@@ -15,5 +15,7 @@ class Settings:
     # and use it to post as the token owner.
     linkedin_scopes: str = os.getenv("LINKEDIN_SCOPES", "openid profile email w_member_social")
     fernet_key: str = os.getenv("FERNET_KEY", "")
+    # Toggle to enable dev-only endpoints (like callback_no_state). Default is False in prod.
+    enable_dev_endpoints: bool = os.getenv("ENABLE_DEV_ENDPOINTS", "false").lower() in ("1", "true", "yes")
 
 settings = Settings()
