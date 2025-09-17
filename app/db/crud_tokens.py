@@ -1,10 +1,27 @@
-﻿# Helper: returns True if token is missing or expires within skew_seconds (default 5 min)
+﻿from datetime import datetime, timezone, timedelta
+from sqlalchemy.orm import Session
+from typing import Optional
+from app.db import models; from app.db import token_crypto
+
+# Helper: returns True if token is missing or expires within skew_seconds (default 5 min)
+# Helper: returns True if token is missing or expires within skew_seconds (default 5 min)
 def is_token_expiring(tok, skew_seconds=300):
     from datetime import datetime, timezone, timedelta
+
     if not tok or not getattr(tok, "expires_at", None):
         return True
-    now = datetime.now(timezone.utc)
-    return tok.expires_at <= now + timedelta(seconds=skew_seconds)
+
+    def as_utc_aware(dt):
+        # If DB returned a naive datetime, treat it as UTC.
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    now_utc = datetime.now(timezone.utc)
+    exp_utc = as_utc_aware(tok.expires_at)
+
+    return exp_utc <= now_utc + timedelta(seconds=skew_seconds)
+
 # Update only access_token and expires_at for latest token
 def update_access_token_only(db: Session, user_id: int, access_token: str, expires_in: int) -> Optional[models.LinkedInToken]:
     tok = (
@@ -20,10 +37,24 @@ def update_access_token_only(db: Session, user_id: int, access_token: str, expir
     db.commit()
     db.refresh(tok)
     return tok
-from datetime import datetime, timezone, timedelta
-from sqlalchemy.orm import Session
-from typing import Optional
-from app.db import models; from app.db import token_crypto
+# add near other helpers
+def set_user_member_id(db: Session, user_id: int, member_id: str) -> models.User:
+    """Persist the LinkedIn OpenID 'sub' (member_id) onto the User row."""
+    u = db.query(models.User).filter(models.User.id == user_id).first()
+    if not u:
+        raise ValueError(f"User {user_id} not found")
+    u.member_id = member_id
+    db.commit()
+    db.refresh(u)
+    return u
+
+def set_user_person_id(db: Session, user_id: int, person_id: str) -> None:
+    """Persist the LinkedIn numeric person id onto the User row."""
+    u = db.query(models.User).filter(models.User.id == user_id).first()
+    if not u:
+        return
+    u.person_id = person_id
+    db.commit()
 
 def upsert_user(db: Session, email: Optional[str] = None) -> models.User:
     if email:

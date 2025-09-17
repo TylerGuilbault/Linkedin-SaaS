@@ -1,87 +1,35 @@
-﻿# GET /auth/linkedin/me?user_id=…
-@router.get("/me")
-def linkedin_me(user_id: int, db: Session = Depends(get_db)):
-    from app.db.models import User
-    refreshed = False
-    user = db.query(User).filter(User.id == user_id).first()
-    tok = crud_tokens.get_latest_token(db, user_id=user_id)
-    member_id = user.member_id if user else None
-    expires_at = getattr(tok, "expires_at", None)
-    has_refresh_token = bool(getattr(tok, "refresh_token_encrypted", None))
-    # If token is expiring and refresh token exists, try to refresh
-    if tok and crud_tokens.is_token_expiring(tok) and has_refresh_token:
-        refresh_token = crud_tokens.get_latest_refresh_token(db, user_id)
-        if refresh_token:
-            from app.db.token_crypto import decrypt_token as decrypt_refresh
-            try:
-                plain_refresh = decrypt_refresh(refresh_token)
-                resp = linkedin_api.exchange_refresh_for_token(plain_refresh)
-                access_token_new = resp.get("access_token")
-                expires_in_new = resp.get("expires_in", 3600)
-                if access_token_new:
-                    crud_tokens.update_access_token_only(db, user_id, access_token_new, expires_in_new)
-                    tok = crud_tokens.get_latest_token(db, user_id=user_id)
-                    expires_at = getattr(tok, "expires_at", None)
-                    refreshed = True
-            except Exception:
-                refreshed = False
-    return {
-        "member_id": member_id,
-        "token_expires_at": expires_at.isoformat() if expires_at else None,
-        "has_refresh_token": has_refresh_token,
-        "refreshed": refreshed
-    }
-# POST /auth/linkedin/refresh { user_id }
-from pydantic import BaseModel
-
-class RefreshIn(BaseModel):
-    user_id: int
-
-
-router = APIRouter(prefix="/auth/linkedin", tags=["linkedin-auth"])
-
-@router.post("/refresh")
-def refresh_linkedin_token(body: RefreshIn, db: Session = Depends(get_db)):
-    refresh_token = crud_tokens.get_latest_refresh_token(db, user_id=body.user_id)
-    if not refresh_token:
-        return error_response(400, "No refresh_token found for this user_id.")
-    try:
-        token_resp = linkedin_api.exchange_refresh_for_token(refresh_token)
-    except Exception as e:
-        return error_response(400, f"LinkedIn refresh failed: {e}")
-    access_token = token_resp.get("access_token")
-    expires_in = token_resp.get("expires_in", 3600)
-    new_refresh_token = token_resp.get("refresh_token", refresh_token)
-    if not access_token:
-        return error_response(400, "No access_token in LinkedIn response.", token_resp)
-    crud_tokens.save_linkedin_token(db, body.user_id, access_token, expires_in, new_refresh_token)
-    return {"status": "ok", "access_token": "updated", "expires_in": expires_in}
-# Centralized error response helper
-def error_response(status_code: int, message: str, details: dict = None):
-    # Never include secrets or sensitive config in error details
-    safe_details = {k: v for k, v in (details or {}).items() if k != "client_secret"}
-    return JSONResponse(
-        status_code=status_code,
-        content={
-            "status": "error",
-            "message": message,
-            "details": safe_details,
-        },
-    )
-# app/routers/auth_linkedin.py
+﻿# app/routers/auth_linkedin.py
 import secrets
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import RedirectResponse, JSONResponse
 from sqlalchemy.orm import Session
 
 from app.deps import get_db
 from app.config import settings
 import app.services.linkedin_api as linkedin_api
+from app.services.linkedin_api import userinfo_sub, me_id
 from app.db import crud_tokens
+from app.db.token_crypto import decrypt_token as _dec
+from app.db.models import User
 
+# Router must be defined after imports
 router = APIRouter(prefix="/auth/linkedin", tags=["linkedin-auth"])
+
+# simple in-memory state store (fine for local dev)
 STATE_STORE: set[str] = set()
+
+@router.get("/me")
+def me():
+    # simple health/config sanity
+    return {
+        "status": "ok",
+        "has_client_id": bool(settings.linkedin_client_id),
+        "has_secret": bool(settings.linkedin_client_secret),
+        "has_fernet": bool(settings.fernet_key),
+        "redirect_uri": settings.linkedin_redirect_uri,
+    }
 
 @router.get("/login")
 def login() -> RedirectResponse:
@@ -89,7 +37,9 @@ def login() -> RedirectResponse:
         raise HTTPException(500, "Missing LinkedIn or FERNET config in .env")
     state = secrets.token_urlsafe(24)
     STATE_STORE.add(state)
-    url = linkedin_api.auth_url(state)
+    # Request OpenID 'profile' plus w_member_social only (r_liteprofile removed per app authorization)
+    scopes = "openid profile w_member_social"
+    url = linkedin_api.auth_url(state, scopes=scopes)
     print("AUTH_URL =>", url, flush=True)
     return RedirectResponse(url)
 
@@ -105,41 +55,130 @@ def callback(
     if error:
         if state in STATE_STORE:
             STATE_STORE.discard(state)
-        return error_response(400, error, {"error_description": error_description})
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": error, "error_description": error_description},
+        )
 
     if not code or not state:
-        return error_response(400, "Missing ?code or ?state in callback")
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": "Missing ?code or ?state in callback"},
+        )
 
     if state not in STATE_STORE:
-        return error_response(400, "Invalid state")
+        raise HTTPException(400, "Invalid state")
     STATE_STORE.discard(state)
 
     token_resp = linkedin_api.exchange_code_for_token(code)
     access_token = token_resp.get("access_token")
     expires_in = token_resp.get("expires_in", 3600)
-    id_token = token_resp.get("id_token")  # present because we requested 'openid'
-    refresh_token = token_resp.get("refresh_token")
+    id_token = token_resp.get("id_token")
 
     if not access_token:
-        # Never leak secrets in error details
-        return error_response(400, "Token exchange failed", {k: v for k, v in token_resp.items() if k != "client_secret"})
+        raise HTTPException(400, f"Token exchange failed: {token_resp}")
 
-    # Create local user + store encrypted access token and refresh token
-    user = crud_tokens.upsert_user(db, email=None)
-    crud_tokens.save_linkedin_token(db, user.id, access_token, expires_in, refresh_token)
+    # Extract member_id from id_token.sub (OpenID Connect). Do NOT call /v2/me here.
+    member_id = linkedin_api.extract_sub_from_id_token(id_token) if id_token else ""
 
-    # If using OpenID, pull the member id from the id_token's 'sub'
-    member_id = linkedin_api.extract_sub_from_id_token(id_token) if id_token else None
+    # If we have an OpenID sub (member_id), try to reuse an existing User with that member_id.
+    user = None
     if member_id:
-        print("LinkedIn member_id (sub):", member_id, flush=True)
-        # Store member_id in User
-        user.member_id = member_id
-        db.commit()
+        user = db.query(User).filter(User.member_id == member_id).first()
+
+    # If no matching user, create one
+    if not user:
+        user = crud_tokens.upsert_user(db, email=None)
+
+    # Save token for the resolved user
+    crud_tokens.save_linkedin_token(db, user.id, access_token, expires_in)
+
+    # Persist member_id on the user row if we have one and it's not set
+    if member_id:
+        try:
+            if not user.member_id:
+                crud_tokens.set_user_member_id(db, user.id, member_id)
+        except Exception:
+            # non-fatal: we still return success with the token saved
+            print("Failed to persist member_id on user", flush=True)
 
     return {
         "status": "ok",
         "user_id": user.id,
         "expires_in": expires_in,
         "has_id_token": bool(id_token),
-        "member_id": member_id,
+        "member_id": member_id or None,
     }
+
+# Debug helper to compare token owner and stored member_id
+@router.get("/debug/whoami")
+def whoami(user_id: int = Query(...), db: Session = Depends(get_db)):
+    tok = crud_tokens.get_latest_token(db, user_id=user_id)
+    if not tok:
+        return {"status": "no_token"}
+
+    access_token = _dec(tok.access_token_encrypted)
+    token_sub = userinfo_sub(access_token) or None
+
+    user = db.query(User).filter(User.id == user_id).first()
+    db_member_id = user.member_id if user else None
+    db_person_id = user.person_id if user else None
+
+    return {
+        "status": "ok",
+        "user_id": user_id,
+        "openid_sub": token_sub,
+        "person_id": db_person_id,
+        "db_member_id": db_member_id,
+        "author_person_urn": f"urn:li:person:{db_person_id}" if db_person_id else None,
+        "author_member_urn": f"urn:li:member:{token_sub}" if token_sub else None,
+        "match": bool(token_sub and db_member_id and token_sub == db_member_id),
+    }
+
+
+@router.post("/save_person_id")
+def save_person_id(user_id: int, db: Session = Depends(get_db)):
+    """Call /v2/me with the stored access token and persist numeric person id to the User row if available.
+    On failure, include LinkedIn's status and response body to aid debugging (e.g., missing scope or error).
+    """
+    tok = crud_tokens.get_latest_token(db, user_id=user_id)
+    if not tok:
+        raise HTTPException(400, "No token for user_id")
+    access = _dec(tok.access_token_encrypted)
+    pid, status, body = linkedin_api.get_person_id_with_response(access)
+    if not pid:
+        # Return LinkedIn response details in the error so the client (PowerShell) can see why it failed
+        msg = "Could not obtain numeric person id from /v2/me; token likely missing profile scope. Re-login via /auth/linkedin/login."
+        details = {"linkedin_status": status, "linkedin_body": body}
+        raise HTTPException(400, f"{msg} details={details}")
+    # persist
+    try:
+        from app.db import crud_tokens as ct
+        ct.set_user_person_id(db, user_id, pid)
+    except Exception as e:
+        raise HTTPException(500, f"Failed to persist person id: {e}")
+    return {"status": "ok", "person_id": pid}
+
+
+@router.post("/set_person_id")
+def set_person_id(user_id: int, person_id: str, db: Session = Depends(get_db)):
+    """Admin helper: persist a numeric person id for a user (useful if you already know the digits)."""
+    if not str(person_id).isdigit():
+        raise HTTPException(400, "person_id must be digits only")
+    try:
+        from app.db import crud_tokens as ct
+        ct.set_user_person_id(db, user_id, person_id)
+    except Exception as e:
+        raise HTTPException(500, f"Failed to persist person id: {e}")
+    return {"status": "ok", "person_id": person_id}
+
+
+@router.get("/me_raw")
+def me_raw(user_id: int, db: Session = Depends(get_db)):
+    """Dev helper: return the raw /v2/me response (status, headers, text, json) using the stored token."""
+    tok = crud_tokens.get_latest_token(db, user_id=user_id)
+    if not tok:
+        raise HTTPException(400, "No token for user_id")
+    access = _dec(tok.access_token_encrypted)
+    out = linkedin_api.get_me_raw(access)
+    return {"status": "ok", "me_raw": out}

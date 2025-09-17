@@ -29,6 +29,7 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String(320), unique=True, nullable=True)
     member_id = Column(String(32), nullable=True, index=True)
+    person_id = Column(String(64), nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 class LinkedInToken(Base):

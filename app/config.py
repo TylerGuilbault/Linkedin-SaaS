@@ -11,7 +11,9 @@ class Settings:
     linkedin_client_id: str = os.getenv("LINKEDIN_CLIENT_ID", "")
     linkedin_client_secret: str = os.getenv("LINKEDIN_CLIENT_SECRET", "")
     linkedin_redirect_uri: str = os.getenv("LINKEDIN_REDIRECT_URI", "http://localhost:8000/auth/linkedin/callback")
-    linkedin_scopes: str = os.getenv("LINKEDIN_SCOPES", "r_liteprofile r_emailaddress w_member_social")
+    # Use OpenID scopes (no r_liteprofile). The app will persist the OpenID sub as member_id
+    # and use it to post as the token owner.
+    linkedin_scopes: str = os.getenv("LINKEDIN_SCOPES", "openid profile email w_member_social")
     fernet_key: str = os.getenv("FERNET_KEY", "")
 
 settings = Settings()
