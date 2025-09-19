@@ -1,4 +1,5 @@
-﻿from sqlalchemy import Column, Integer, String, Text, DateTime
+﻿# app/db/models.py
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey
 from sqlalchemy.sql import func
 from app.db.base import Base
 
@@ -22,14 +23,13 @@ class Post(Base):
     # new fields for scheduling/state
     sent_at = Column(DateTime(timezone=True), nullable=True)
     platform_status = Column(String(128), nullable=True)  # e.g., 'queued','posted','failed:...'
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, func
 
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String(320), unique=True, nullable=True)
-    member_id = Column(String(32), nullable=True, index=True)
-    person_id = Column(String(64), nullable=True, index=True)
+    member_id = Column(String(32), nullable=True, index=True)  # OpenID sub
+    person_id = Column(String(64), nullable=True, index=True)  # numeric /v2/me id (optional)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 class LinkedInToken(Base):
@@ -37,6 +37,7 @@ class LinkedInToken(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     access_token_encrypted = Column(Text, nullable=False)
-    refresh_token_encrypted = Column(Text, nullable=True)  # encrypted refresh token
+    refresh_token_encrypted = Column(Text, nullable=True)
+    id_token_encrypted = Column(Text, nullable=True)            # ← ADD THIS
     expires_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

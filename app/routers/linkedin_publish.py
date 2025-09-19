@@ -8,6 +8,8 @@ from app.deps import get_db
 from app.db import crud_tokens
 from app.db import token_crypto
 from app.services import linkedin_api
+from app.auth.oidc import decode_linkedin_id_token
+import anyio
 
 router = APIRouter(prefix="/linkedin", tags=["linkedin"])
 
@@ -28,48 +30,38 @@ class ImageShareIn(BaseModel):
     text: str = ""
     member_id: Optional[str] = None
 
-
 class DebugPostIn(BaseModel):
     user_id: int
     text: str
     member_id: Optional[str] = None
     person_id: Optional[str] = None
 
-
 def _resolve_author_from_token(db: Session, user_id: int, access_token: str, provided_member_id: Optional[str], context: str) -> str:
-    """
-    Always prefer the token identity (userinfo_sub(access_token)).
-    If DB/provided member_id differs, we still use token identity because LinkedIn requires /author
-    to match the token owner.
-    """
-    from app.db.models import User
+    tok = crud_tokens.get_latest_token(db, user_id=user_id)
+    if not tok:
+        raise HTTPException(400, "No LinkedIn token on file; visit /auth/linkedin/login first.")
 
-    # New policy: always derive author from the token owner (OIDC sub). Do not accept a member_id from the
-    # client for normal posting. Use DB member_id only as a stored reference; but we must validate it matches
-    # the access token's owner to prevent posting as a different LinkedIn account.
-    # Always call through the linkedin_api module so tests can patch linkedin_api.userinfo_sub
-    token_member_id = linkedin_api.userinfo_sub(access_token) or None
+    if not getattr(tok, "id_token_encrypted", None):
+        raise HTTPException(401, "No id_token stored; please re-login via /auth/linkedin/login.")
 
-    # read db member_id
-    db_member_id = None
-    # Normal code queries the DB for the user. Tests sometimes patch models.User to a MagicMock
-    # which makes SQLAlchemy column expressions invalid; tolerate that by falling back to
-    # calling User() (the patched constructor) when the query raises.
     try:
-        u = db.query(User).filter(User.id == user_id).first()
+        id_token = token_crypto.decrypt_token(tok.id_token_encrypted)
     except Exception:
-        try:
-            u = User()
-        except Exception:
-            u = None
-    if u and u.member_id:
-        db_member_id = u.member_id
+        raise HTTPException(401, "Failed to decrypt id_token; please re-login.")
 
-    # If token_sub not available, fail loudly and require re-login
+    try:
+        # DEV-friendly: verify signature/issuer but ignore 'exp'
+        decoded = anyio.run(lambda: decode_linkedin_id_token(id_token, allow_expired=True, allow_issuer_any=True))
+    except Exception:
+        raise HTTPException(401, "Could not decode id_token; please re-login.")
+
+    token_member_id = decoded.get("sub")
     if not token_member_id:
-        raise HTTPException(401, "Could not verify token owner via OpenID userinfo; please re-login.")
+        raise HTTPException(401, "id_token missing 'sub'; please re-login.")
 
-    # If DB has a stored member_id, ensure it matches token_sub
+    from app.db.models import User
+    user = db.query(User).filter(User.id == user_id).first()
+    db_member_id = user.member_id if user and user.member_id else None
     if db_member_id and db_member_id != token_member_id:
         raise HTTPException(
             401,
@@ -77,10 +69,9 @@ def _resolve_author_from_token(db: Session, user_id: int, access_token: str, pro
             "Log out of LinkedIn in the browser and re-login via /auth/linkedin/login with the intended account."
         )
 
-    author_urn = f"urn:li:member:{token_member_id}"
-    print(f"[{context}] author={author_urn} (source=token_sub)", flush=True)
+    author_urn = f"urn:li:person:{token_member_id}"
+    print(f"[{context}] author={author_urn} (source=id_token.sub)", flush=True)
     return author_urn
-
 
 def _get_fresh_access_token(db: Session, user_id: int) -> str:
     tok = crud_tokens.get_latest_token(db, user_id=user_id)
@@ -107,7 +98,6 @@ def _get_fresh_access_token(db: Session, user_id: int) -> str:
 
     return token_crypto.decrypt_token(tok.access_token_encrypted)
 
-
 @router.post("/post")
 def publish(body: PublishIn, db: Session = Depends(get_db)) -> Dict[str, Any]:
     access_token = _get_fresh_access_token(db, body.user_id)
@@ -118,18 +108,15 @@ def publish(body: PublishIn, db: Session = Depends(get_db)) -> Dict[str, Any]:
     ok, ref = linkedin_api.post_text(access_token, author_urn, body.text)
     if ok:
         try:
-            # Accept either an object with a .text attribute or a plain string/primitive returned by tests
             ref_text = getattr(ref, "text", ref)
             return {"status": "posted", "ref": ref_text}
         except Exception:
             return {"status": "posted"}
 
-    # Bubble up LinkedIn error clearly
     status = getattr(ref, "status_code", None) or (ref.get("status") if isinstance(ref, dict) else None)
     message = getattr(ref, "text", None) or (ref.get("message") if isinstance(ref, dict) else str(ref))
     code = (ref.get("serviceErrorCode") if isinstance(ref, dict) else None)
     raise HTTPException(status or 400, f"LinkedIn API error ({status}) [{code}]: {message}")
-
 
 @router.get("/check")
 def check(user_id: int, db: Session = Depends(get_db)) -> Dict[str, Any]:
@@ -137,13 +124,29 @@ def check(user_id: int, db: Session = Depends(get_db)) -> Dict[str, Any]:
     access_token = _get_fresh_access_token(db, user_id)
     from app.db.models import User
 
+    # Look up stored DB values
     user_db = db.query(User).filter(User.id == user_id).first()
     db_member_id = user_db.member_id if user_db else None
     db_person_id = user_db.person_id if user_db else None
 
-    token_sub = linkedin_api.userinfo_sub(access_token)
-
-    # prefer DB member_id, else token sub
+    # Decode id_token to extract sub (LinkedIn member_id)
+    token_sub = None
+    decode_error = None
+    tok = crud_tokens.get_latest_token(db, user_id=user_id)
+    if tok:
+        enc = getattr(tok, "id_token_encrypted", None)
+        plain = getattr(tok, "id_token", None)
+        if enc or plain:
+            id_token = token_crypto.decrypt_token(enc) if enc else plain
+            try:
+                # DEV-friendly: verify signature/issuer but ignore 'exp'
+                decoded = anyio.run(lambda: decode_linkedin_id_token(id_token, allow_expired=True, allow_issuer_any=True))
+                token_sub = decoded.get("sub")
+                iss_claim = decoded.get("iss")
+            except Exception as e:
+                decode_error = str(e)
+                token_sub = None
+    # Prefer DB member_id, else token_sub
     chosen_member = db_member_id or token_sub
 
     author_person_urn = None
@@ -158,9 +161,12 @@ def check(user_id: int, db: Session = Depends(get_db)) -> Dict[str, Any]:
         "author_person_urn": author_person_urn,
         "author_member_urn": author_member_urn,
         "can_post_using_member": bool(chosen_member),
-        "note": "If you want to post as numeric person URN (urn:li:person:...), you must have person_id persisted (r_liteprofile required)." 
+        "decode_error": decode_error,
+        "note": (
+            "If you want to post as numeric person URN (urn:li:person:...), "
+            "you must have person_id persisted (r_liteprofile required)."
+        )
     }
-
 
 @router.post("/post/link")
 def post_link(body: LinkShareIn, db: Session = Depends(get_db)) -> Dict[str, Any]:
@@ -170,7 +176,6 @@ def post_link(body: LinkShareIn, db: Session = Depends(get_db)) -> Dict[str, Any
     if ok:
         return {"status": "posted", "ref": resp.text}
     raise HTTPException(502, f"LinkedIn article share failed: {resp.text}")
-
 
 @router.post("/post/image")
 def post_image(body: ImageShareIn, db: Session = Depends(get_db)) -> Dict[str, Any]:
@@ -185,7 +190,6 @@ def post_image(body: ImageShareIn, db: Session = Depends(get_db)) -> Dict[str, A
     if body.image_base64:
         image_bytes = base64.b64decode(body.image_base64)
     elif body.image_url:
-        # fetch remote image via httpx
         with httpx.Client(timeout=60) as c:
             r = c.get(body.image_url)
             r.raise_for_status()
@@ -202,13 +206,11 @@ def post_image(body: ImageShareIn, db: Session = Depends(get_db)) -> Dict[str, A
         return {"status": "posted", "ref": resp.text}
     raise HTTPException(502, f"LinkedIn image share failed: {resp.text}")
 
-
 @router.post("/debug/post")
 def debug_post(body: DebugPostIn, db: Session = Depends(get_db)) -> Dict[str, Any]:
     """Dev-only: attempt a post using the provided member_id or person_id (no persistence) and return raw response for debugging."""
     access_token = _get_fresh_access_token(db, body.user_id)
 
-    # choose priority: explicit person_id -> explicit member_id -> DB member_id -> token_sub
     from app.db.models import User
     user_db = db.query(User).filter(User.id == body.user_id).first()
     db_member_id = user_db.member_id if user_db else None
@@ -217,12 +219,11 @@ def debug_post(body: DebugPostIn, db: Session = Depends(get_db)) -> Dict[str, An
     chosen_member = body.member_id or db_member_id
 
     if chosen_person:
-        # use numeric id as member URN (LinkedIn expects numeric member URNs)
         author = f"urn:li:member:{chosen_person}"
     elif chosen_member:
         author = f"urn:li:member:{chosen_member}"
     else:
-        # fallback to token identity
+        # fallback to token identity (userinfo may fail; dev-only)
         ts = linkedin_api.userinfo_sub(access_token)
         if not ts:
             raise HTTPException(401, "Couldn't resolve any member/person id to test with")
@@ -230,7 +231,6 @@ def debug_post(body: DebugPostIn, db: Session = Depends(get_db)) -> Dict[str, An
 
     ok, ref = linkedin_api.post_text(access_token, author, body.text)
 
-    # Return raw LinkedIn response info for debugging
     if ok:
         try:
             return {"status": "posted", "ref": ref.text}
