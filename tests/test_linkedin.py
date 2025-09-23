@@ -27,6 +27,7 @@ def test_post_uses_stored_member_id_when_missing_in_body(mock_user, mock_get_tok
     mock_get_token.return_value = mock_token
     with patch("app.db.token_crypto.decrypt_token", return_value="access"), \
          patch("app.services.linkedin_api.post_text", return_value=(True, "ref")), \
+         patch("app.services.linkedin_api.userinfo_sub", return_value="stored_id"), \
          patch("sqlalchemy.orm.Session.query") as mock_query:
         mock_query.return_value.filter.return_value.first.return_value = mock_user_obj
         resp = client.post("/linkedin/post", json={"user_id": 1, "text": "hi"})
@@ -47,8 +48,9 @@ def test_post_triggers_refresh_when_expired(mock_update, mock_exchange, mock_get
     mock_exchange.return_value = {"access_token": "new_access", "expires_in": 3600}
     mock_update.return_value = MagicMock()
     with patch("app.db.token_crypto.decrypt_token", return_value="access"), \
-         patch("app.services.linkedin_api.post_text", return_value=(True, "ref")), \
-         patch("app.db.models.User") as mock_user:
+        patch("app.services.linkedin_api.post_text", return_value=(True, "ref")), \
+        patch("app.services.linkedin_api.userinfo_sub", return_value="stored_id"), \
+        patch("app.db.models.User") as mock_user:
         mock_user_obj = MagicMock()
         mock_user_obj.member_id = "stored_id"
         mock_user.return_value = mock_user_obj
